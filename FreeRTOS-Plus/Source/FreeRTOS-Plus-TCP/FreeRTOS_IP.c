@@ -1841,7 +1841,9 @@ uint8_t ucProtocol;
 		usGenerateChecksum(). */
 
 		/* due to compiler warning "integer operation result is out of range" */
-
+		#if ipconfigDRIVER_INCLUDED_TX_IP_CHECKSUM
+		pxICMPHeader->usChecksum=0;
+		#else
 		usRequest = ( uint16_t ) ( ( uint16_t )ipICMP_ECHO_REQUEST << 8 );
 
 		if( pxICMPHeader->usChecksum >= FreeRTOS_htons( 0xFFFFU - usRequest ) )
@@ -1852,6 +1854,7 @@ uint8_t ucProtocol;
 		{
 			pxICMPHeader->usChecksum = pxICMPHeader->usChecksum + FreeRTOS_htons( usRequest );
 		}
+		#endif
 		return eReturnEthernetFrame;
 	}
 
