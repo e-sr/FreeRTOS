@@ -41,12 +41,48 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <ti/drivers/power/PowerMSP432E4.h>
 
 /* FreeRTOS includes. */
+#include "FreeRTOSIPConfig.h"
 #include "FreeRTOS_IP.h"
 #include "NetworkBufferManagement.h"
 #include "FreeRTOS_IP_Private.h"
-#include "FreeRTOSIPConfig.h"
 
 #include "MSP432E4_Networkinterface.h"
+
+/* check  FreeRTOSIPConfig.h*/
+
+#if (ipconfigDRIVER_INCLUDED_TX_IP_CHECKSUM == 0)
+    #warning ipconfigDRIVER_INCLUDED_TX_IP_CHECKSUM can be set to 1.
+#endif
+
+#if (ipconfigDRIVER_INCLUDED_RX_IP_CHECKSUM == 0)
+    #warning ipconfigDRIVER_INCLUDED_RX_IP_CHECKSUM should be set to 1.
+#endif
+
+#if (ipconfigUSE_LINKED_RX_MESSAGES == 1)
+    #error ipconfigUSE_LINKED_RX_MESSAGES should be set to 0.
+#endif
+
+#if (ipconfigZERO_COPY_TX_DRIVER == 0)
+    #error ipconfigZERO_COPY_TX_DRIVER should be set to 1.
+#endif
+
+/* 
+the msp432 can calculate ICMP checksum in driver. 
+settings FIX_ICMP_CHECKSUM_IN_DRIVER to 1 fix frames for a correct ICMP 
+calculation in peripheral.
+It has only effect if ipconfigDRIVER_INCLUDED_TX_IP_CHECKSUM is set to 0
+*/
+#define FIX_ICMP_CHECKSUM_IN_DRIVER 1
+
+/* PHY linkstatus read in xGetPhyLinkStatus 
+ if FORCE_LINK_STATUS_READ_IN_xGetPhyLinkStatus is 0 the linkUp 
+ variable is used instead of polling the PHY. 
+ The linkup variable is setted in ISR by PHY interrupt events 
+ by prvProcessPhyInterrupt 
+*/
+#ifndef FORCE_LINK_STATUS_READ_IN_xGetPhyLinkStatus
+    #define FORCE_LINK_STATUS_READ_IN_xGetPhyLinkStatus 0
+#endif
 
 /* PHY phisical address, internal PHY */
 #define PHY_PHYS_ADDR       0
@@ -62,7 +98,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 /* 
 * NETWORK_BUFFER_DESCRIPTORS_LEN is defined as follow:
 *
-* ipTOTAL_ETHERNET_FRAME_SIZE = eth_header +  ipconfigNETWORK_MTU  + crc + 4 
+* ipTOTAL_ETHERNET_FRAME_SIZE = eth_header +  ipconfigNETWORK_MTU  + crc + ipSIZE_OF_ETH_OPTIONAL_802_1Q_TAG_BYTES
 *                                  14      +  1500                 +  4  + 4 = 1522 
 *
 * ipBUFFER_PADDING = 8 + ipconfigPACKET_FILLER_SIZE = 10 bytes 
@@ -87,15 +123,14 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #ifndef ipconfigPACKET_FILLER_SIZE
     #define ipconfigPACKET_FILLER_SIZE 2
-#else
-    #if !(ipconfigPACKET_FILLER_SIZE==2)
+#elif !(ipconfigPACKET_FILLER_SIZE==2)
     #error ipconfigPACKET_FILLER_SIZE has to be 2.
-    #endif
 #endif
+
 
 #define ROUNDUP_4BYTES(X)  ((((X) + 3) / 4) * 4)
 
-#define NETWORK_BUFFER_DESCRIPTORS_LEN  ROUNDUP_4BYTES( (10 + ipTOTAL_ETHERNET_FRAME_SIZE) )
+#define NETWORK_BUFFER_DESCRIPTORS_LEN  ROUNDUP_4BYTES( (8 + ipconfigPACKET_FILLER_SIZE + ipTOTAL_ETHERNET_FRAME_SIZE) )
 
 /*
  * pxGetNetworkBufferWithDescriptor return a staic allocated buffer of fixed size,
@@ -103,6 +138,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 #define GET_BUFFER_SIZE 0
+
 
 /*
  * Define checksum related macros that are missing from driverlib
@@ -127,6 +163,33 @@ considers need processing. */
 #define ipCONSIDER_FRAME_FOR_PROCESSING( pucEthernetBuffer ) eConsiderFrameForProcessing( ( pucEthernetBuffer ) )
 #endif
 
+
+/*For RX operation, if FIFO store-and-forward mode is enabled and a frame is read by the 
+DMA only after it is completely written into the RX FIFO. 
+In cut-through mode, DMA transfer is started after reaching of a given Threshold.
+TX is similar in the other direction.
+*/
+#define DMA_STORE_FORWARD_RX_OPERATION 0
+#if DMA_STORE_FORWARD_RX_OPERATION
+#define DMA_OP_MODE (EMAC_MODE_TX_STORE_FORWARD | \ 
+                     EMAC_MODE_RX_STORE_FORWARD)
+#else /*cut-through mode*/
+#define DMA_OP_MODE (EMAC_MODE_TX_STORE_FORWARD | \ 
+                     EMAC_MODE_RX_THRESHOLD_128_BYTES)
+#endif
+
+/* How error RX framaes are handled depend on the FIFO mode and on some
+Register fields in EMACDMAOPMODE. 
+In cut-through mode, only frames smaller than DMA transfer threshold, can be dropped before DMA transfers,
+store-and-forward mode frames are per default dropped, if FEF bit is set then are not dropped.
+The DT fields control forward of frames with error in the tcp/ip payload 
+*/
+#define DMA_ERR_FORWARD 0
+#if DMA_ERR_FORWARD
+    #define DMA_ERR_MODE  (EMAC_MODE_KEEP_BAD_CRC | EMAC_MODE_RX_ERROR_FRAMES)
+#else
+    #define DMA_ERR_MODE 0
+#endif
 
 /*
  *  Helper struct holding a DMA descriptor and the Network Buffer Descriptors it currently refers to.
@@ -244,7 +307,7 @@ static uint8_t ucBuffers[ ipconfigNUM_NETWORK_BUFFER_DESCRIPTORS][NETWORK_BUFFER
 
 
 /* Application is required to provide this variable */
-extern const EMACMSP432E4_HWAttrs EMACMSP432E4_hwAttrs;
+extern const EMACMSP432E4_DriverAttrs g_EMAC_DriverAttrs;
 
 /* The queue used to pass events into the IP-task for processing. */
 extern QueueHandle_t xNetworkEventQueue;
@@ -266,32 +329,25 @@ BaseType_t xNetworkInterfaceInitialise( void )
     xEMAC_prv.ulTxPayloadChksmErrors = 0;
     xEMAC_prv.ulAbnormalInts = 0;
     xEMAC_prv.ulIsrCount = 0;
-    xEMAC_prv.linkUp       = pdFALSE;
+    xEMAC_prv.linkUp       = 0;
     memset(xEMAC_prv.ulDescriptorLoopCount, 0,
             sizeof(xEMAC_prv.ulDescriptorLoopCount));
 
-    if (prvEmacStart()== pdTRUE)
-    {
-        #if USE_DEFERRED_INTERRUPT
-        #endif
-        return pdTRUE;
-    }
-    else
-    {
-        return pdFALSE;
-    }
+    return prvEmacStart();
 }
 /*-------------------------------------------*/
 
 BaseType_t xNetworkInterfaceOutput( NetworkBufferDescriptor_t * const pxNetworkBuffer, BaseType_t xReleaseAfterSend )
 {
-    DescriptorRef_t *pxDesc;
+    DescriptorRef_t *pxDescRef;
 
-    /* get descriptor reference */
-    pxDesc = &(xEMAC_prv.pxTxDescList->pxDescriptorRef[xEMAC_prv.pxTxDescList->ulWrite]);
-    
-    /* if no dma buffer available*/
-    if (pxDesc->pxNetworkBuffer) {
+    /* get next descriptorRef */
+    pxDescRef = &(xEMAC_prv.pxTxDescList->pxDescriptorRef[xEMAC_prv.pxTxDescList->ulWrite]);
+    /* the pxDescRef contain a reference to a pxNethworkBuffer,
+       then the buffer is in use. prvProcessTransmitted will free the buffer.
+     */
+    if (pxDescRef->pxNetworkBuffer) {
+        /* DMA buffer has associated a pxNetworkBuffer*/
         vReleaseNetworkBufferAndDescriptor(pxNetworkBuffer);
         xEMAC_prv.ulTxDropped++;
         
@@ -299,27 +355,50 @@ BaseType_t xNetworkInterfaceOutput( NetworkBufferDescriptor_t * const pxNetworkB
 
         return pdFALSE;
     }
+    /* the pxDescRef contain no reference to a pxNethworkBuffer. 
+       we can use it to send the frame. 
+     */
 
     /* Fill in the buffer pointer and length */
-    pxDesc->Desc.ui32Count = pxNetworkBuffer->xDataLength;
-    pxDesc->Desc.pvBuffer1 = pxNetworkBuffer->pucEthernetBuffer;
-    pxDesc->Desc.ui32CtrlStatus = DES0_TX_CTRL_FIRST_SEG;
+    pxDescRef->Desc.ui32Count = pxNetworkBuffer->xDataLength;
+    pxDescRef->Desc.pvBuffer1 = pxNetworkBuffer->pucEthernetBuffer;
+    pxDescRef->Desc.ui32CtrlStatus =  (DES0_TX_CTRL_FIRST_SEG|
+                                    DES0_TX_CTRL_CHAINED  |
+                                    DES0_TX_CTRL_LAST_SEG |
+                                    DES0_TX_CTRL_INTERRUPT);
 
     /* CRC  IP offloading settings */
     #if ipconfigDRIVER_INCLUDED_TX_IP_CHECKSUM
-    pxDesc->Desc.ui32CtrlStatus |= (DES0_TX_CTRL_IP_ALL_CKHSUMS);
-    #endif
-    pxDesc->Desc.ui32CtrlStatus |= DES0_TX_CTRL_CHAINED;
+    /*enable checksum offloading for this frame*/
+    pxDescRef->Desc.ui32CtrlStatus |= (DES0_TX_CTRL_IP_ALL_CKHSUMS);
+    #if FIX_ICMP_CHECKSUM_IN_DRIVER
+    {       
+        /*
+        freeRTOS TCP always calculate  the ICMP checksum.
+        If the peripheral must calculate the checksum, it wants
+        the protocol checksum to have a value of zero. 
+        */ 
+        ProtocolPacket_t *pxPacket;
+            
+        
+        pxPacket = ( ProtocolPacket_t * ) ( pxNetworkBuffer->pucEthernetBuffer );
 
-    pxDesc->Desc.ui32CtrlStatus |= (DES0_TX_CTRL_LAST_SEG |
-                                    DES0_TX_CTRL_INTERRUPT);
+        if( pxPacket->xICMPPacket.xIPHeader.ucProtocol == ( uint8_t ) ipPROTOCOL_ICMP )
+        {
+            pxPacket->xICMPPacket.xICMPHeader.usChecksum = ( uint16_t )0u;
+        }
+	}
+    #endif
+    #endif
+
     xEMAC_prv.pxTxDescList->ulWrite++;
     if (xEMAC_prv.pxTxDescList->ulWrite == NUM_TX_DESCRIPTORS) {
         xEMAC_prv.pxTxDescList->ulWrite = 0;
     }
     /* set the reference to the Network Buffer */
-    pxDesc->pxNetworkBuffer = pxNetworkBuffer;
-    pxDesc->Desc.ui32CtrlStatus |= DES0_TX_CTRL_OWN;
+    pxDescRef->pxNetworkBuffer = pxNetworkBuffer;
+    /* set the Descriptor belonging the DMA */
+    pxDescRef->Desc.ui32CtrlStatus |= DES0_TX_CTRL_OWN;
 
     xEMAC_prv.ulTxSent++;
 
@@ -348,19 +427,16 @@ void vNetworkInterfaceAllocateRAMToBuffers( NetworkBufferDescriptor_t pxNetworkB
 
 BaseType_t xGetPhyLinkStatus( void )
 {
+    #if FORCE_LINK_STATUS_READ_IN_xGetPhyLinkStatus
+    {
     uint32_t newLinkStatus;
-
     /* Check link status */
     newLinkStatus =
-            (EMACPHYRead(EMAC0_BASE, PHY_PHYS_ADDR, EPHY_BMSR) & EPHY_BMSR_LINKSTAT);
-
-    /* Signal the stack if link status changed */
-    if (newLinkStatus != xEMAC_prv.linkUp) {
-        SIGNAL_LINK_CHANGE(xEMAC_prv.linkUp);//xEMAC_prv.hEvent, newLinkStatus, 0);
-    }
-
+            (EMACPHYRead(EMAC0_BASE, PHY_PHYS_ADDR, EPHY_BMSR) & EPHY_BMSR_LINKSTAT)? 1:0;
     /* Set the link status */
     xEMAC_prv.linkUp = newLinkStatus;
+    }
+    #endif
 
     if (xEMAC_prv.linkUp) {
         return pdTRUE;
@@ -377,7 +453,7 @@ BaseType_t xGetPhyLinkStatus( void )
 BaseType_t prvEmacStart()
 {
     uint16_t value;
-    EMACMSP432E4_HWAttrs const *hwAttrs = &EMACMSP432E4_hwAttrs;
+    EMACMSP432E4_DriverAttrs const *hwAttrs = &g_EMAC_DriverAttrs;
     HwiP_Params xHwiParams;
     ClockP_FreqHz freq;
     uint32_t key;
@@ -424,11 +500,9 @@ BaseType_t prvEmacStart()
                                EMAC_CONFIG_SA_FROM_DESCRIPTOR |
                                /* Enable RX Checksum Offload: */
                                EMAC_CONFIG_CHECKSUM_OFFLOAD |
-                               EMAC_CONFIG_BO_LIMIT_1024),
-                  (EMAC_MODE_RX_STORE_FORWARD |
-                   EMAC_MODE_TX_STORE_FORWARD |
-                   EMAC_MODE_TX_THRESHOLD_64_BYTES |
-                   EMAC_MODE_RX_THRESHOLD_64_BYTES), 0);
+                               EMAC_CONFIG_BO_LIMIT_1024 ),
+                               (DMA_OP_MODE | DMA_ERR_MODE), 
+                               0);
 
     /* Program the MAC address into the Ethernet controller. */
     EMACAddrSet(EMAC0_BASE, 0, (uint8_t *)hwAttrs->macAddress);
@@ -521,11 +595,9 @@ static BaseType_t prvInitDMADescriptors(void)
         g_pTxDescriptors[i].pxNetworkBuffer = NULL;
         g_pTxDescriptors[i].Desc.ui32Count = 0;
         g_pTxDescriptors[i].Desc.pvBuffer1 = 0;
+        g_pTxDescriptors[i].Desc.ui32CtrlStatus = 0;
         g_pTxDescriptors[i].Desc.DES3.pLink = ((i == (NUM_TX_DESCRIPTORS - 1)) ?
                &g_pTxDescriptors[0].Desc : &g_pTxDescriptors[i + 1].Desc);
-        g_pTxDescriptors[i].Desc.ui32CtrlStatus = DES0_TX_CTRL_INTERRUPT |
-                DES0_TX_CTRL_IP_ALL_CKHSUMS |
-                DES0_TX_CTRL_CHAINED;
     }
 
     /*
@@ -540,7 +612,6 @@ static BaseType_t prvInitDMADescriptors(void)
         else {
             /*
              *  This is a failing scenario return pdFalse.
-             *  emacStop will do the PBM_free for any allocated packet.
              */
             g_pRxDescriptors[i].Desc.pvBuffer1 = 0;
             g_pRxDescriptors[i].Desc.ui32CtrlStatus = 0;
@@ -566,7 +637,7 @@ static BaseType_t prvInitDMADescriptors(void)
  */
 static BaseType_t prvEmacStop()
 {
-    EMACMSP432E4_HWAttrs const *hwAttrs = &EMACMSP432E4_hwAttrs;
+    EMACMSP432E4_DriverAttrs const *hwAttrs = &g_EMAC_DriverAttrs;
     uint8_t  port;
     int i = 0;
 
@@ -609,7 +680,7 @@ static void prvPrimeRx(NetworkBufferDescriptor_t *pxNetworkBuffer, DescriptorRef
 
     /* We got a buffer so fill in the payload pointer and size. */
     desc->Desc.pvBuffer1 = pxNetworkBuffer->pucEthernetBuffer;
-    desc->Desc.ui32Count |= (NETWORK_BUFFER_DESCRIPTORS_LEN << DES1_RX_CTRL_BUFF1_SIZE_S);
+    desc->Desc.ui32Count |= ((NETWORK_BUFFER_DESCRIPTORS_LEN - 8 )<< DES1_RX_CTRL_BUFF1_SIZE_S);
 
     /* Give this descriptor back to the hardware */
     desc->Desc.ui32CtrlStatus = DES0_RX_CTRL_OWN;
@@ -632,30 +703,36 @@ static void prvHandleRx()
     uint32_t         ui32Mode;
     uint32_t         ui32FrameSz;
     uint32_t         ui32CtrlStatus;
+    DescriptorRef_t *pxDescRef;
 
     IPStackEvent_t xRxEvent;
 
     /* Get a pointer to the receive descriptor list. */
     pDescList = xEMAC_prv.pxRxDescList;
 
-    /* Determine where we start and end our walk of the descriptor list */
+    /* Determine where we start and end our walk of the descriptor list 
+     * if the last ulRead was at descriptor 0 then read till NUM_RX_DESCRIPTORS - 1.
+     * else take in account to wrap around and read till ulRead -1
+     */
     ulDescEnd = pDescList->ulRead ?
             (pDescList->ulRead - 1) : (pDescList->ulNumDescs - 1);
 
     /* Step through the descriptors that are marked for CPU attention. */
     while (pDescList->ulRead != ulDescEnd) {
         descCount++;
-
+        pxDescRef = &(pDescList->pxDescriptorRef[pDescList->ulRead]);
         /* Does the current descriptor have a buffer attached to it? */
-        pxNetworkBuffer = pDescList->pxDescriptorRef[pDescList->ulRead].pxNetworkBuffer;
+        pxNetworkBuffer = pxDescRef->pxNetworkBuffer;
         if (pxNetworkBuffer) {
-            ui32CtrlStatus = pDescList->pxDescriptorRef[pDescList->ulRead].Desc.ui32CtrlStatus; 
+            ui32CtrlStatus = pxDescRef->Desc.ui32CtrlStatus; 
 
-            /* Determine if the host has filled it yet. */
+            /* Determine who control the descriptor. */
             if (ui32CtrlStatus & DES0_RX_CTRL_OWN) {
                 /* The DMA engine still owns the descriptor so we are finished. */
                 break;
             }
+
+            #if ( DMA_ERR_FORWARD|(DMA_STORE_FORWARD_RX_OPERATION == 0))
             /* Yes - does the frame contain errors? */
             if (ui32CtrlStatus & DES0_RX_STAT_ERR) {
                 /* This is a bad frame.*/
@@ -670,7 +747,6 @@ static void prvHandleRx()
                 EMACConfigGet(EMAC0_BASE, &ui32Config, &ui32Mode, &ui32FrameSz);
                 if (ui32Config & EMAC_CONFIG_CHECKSUM_OFFLOAD) {
                     /* RX h/w checksums are enabled, look for checksum errors */
-
                     /* First check if the Frame Type bit is set */
                     if (ui32CtrlStatus & DES0_RX_STAT_FRAME_TYPE) {
                          /* Now, if bit 7 is reset and bit 0 is set: */
@@ -686,17 +762,20 @@ static void prvHandleRx()
                              xEMAC_prv.ulRxIpHdrChksmErrors++;
                              xEMAC_prv.ulRxPayloadChksmErrors++;
                         }
-                         
                     }
                 }
-
                 xEMAC_prv.ulRxDropped++;
-                prvPrimeRx(pxNetworkBuffer,
-                        &(pDescList->pxDescriptorRef[pDescList->ulRead]));
-                pDescList->ulRead++;
-                break;
+                /* we dont' pass the frame to the stack, thus wedon't need a new descriptorbuffer
+                 * we can thus reuse the descriptor with the akready present buffer.
+                 */
+                pxNetworkBufferNew = pxNetworkBuffer;
             }
-            else {
+            else 
+            #endif
+            if (ipCONSIDER_FRAME_FOR_PROCESSING( pxNetworkBuffer->pucEthernetBuffer ))
+            {
+            /* This is a good frame so pass it up the stack. */
+
                 /* Allocate a new buffer for this descriptor */
                 pxNetworkBufferNew = pxNetworkBufferGetFromISR(GET_BUFFER_SIZE);
                 if (pxNetworkBufferNew == NULL) {
@@ -708,24 +787,13 @@ static void prvHandleRx()
                     break;
                 }
 
-                /* This is a good frame so pass it up the stack. */
-                len = (pDescList->pxDescriptorRef[pDescList->ulRead].Desc.ui32CtrlStatus &
+                len = (ui32CtrlStatus &
                     DES0_RX_STAT_FRAME_LENGTH_M) >> DES0_RX_STAT_FRAME_LENGTH_S;
 
                 /* Remove the CRC */
                 pxNetworkBuffer->xDataLength= len - CRC_SIZE_BYTES;
-                /*
-                 *  Place the packet onto the receive queue to be handled in the
-                 *  EMACMSP432E4_pkt_service function (which is called by the
-                 *  NDK stack).
-                 */
                 /* Update internal statistic */
                 xEMAC_prv.ulRxCount++;
-
-
-                /* Prime the receive descriptor back up for future packets */
-                prvPrimeRx(pxNetworkBufferNew,
-                        &(pDescList->pxDescriptorRef[pDescList->ulRead]));
                 
                 xRxEvent.eEventType = eNetworkRxEvent;
 
@@ -738,22 +806,30 @@ static void prvHandleRx()
                     /* The buffer could not be sent to the IP task so the buffer
                     must be released. */
                     vNetworkBufferReleaseFromISR( pxNetworkBuffer );
-                    
+
                     iptraceETHERNET_RX_EVENT_LOST();
                 }
                 else{
                     /* The message was successfully sent to the TCP/IP stack. */
                     iptraceNETWORK_INTERFACE_RECEIVE();
                 }                     
+            }else 
+            {   
+                /* we dont' pass the frame to the stack, thus wedon't need a new descriptorbuffer
+                 * we can thus reuse the descriptor with the akready present buffer.
+                 */
+                pxNetworkBufferNew = pxNetworkBuffer;
             }
         }
+
+        /* Prime the receive descriptor back up for future packets */
+        prvPrimeRx(pxNetworkBufferNew, pxDescRef);
         /* Move on to the next descriptor in the chain, taking care to wrap. */
         pDescList->ulRead++;
         if (pDescList->ulRead == pDescList->ulNumDescs) {
             pDescList->ulRead = 0;
         }
     }
-
     /*
      * Update the desciptorLoopCount. This shows how frequently we are cycling
      * through x DMA descriptors, where x is the index of this array. So if
@@ -775,7 +851,6 @@ static void prvProcessTransmitted()
 {
     DescriptorRef_t *pDesc;
     uint32_t     ulNumDescs;
-
     /*
      * Walk the list until we have checked all descriptors or we reach the
      * write pointer or find a descriptor that the hardware is still working
@@ -788,36 +863,27 @@ static void prvProcessTransmitted()
             /* No - we're finished. */
             break;
         }
-
-        /*
-         * Check this descriptor for transmit errors
-         *
-         * First, check the error summary to see if there was any error and if
-         * so, check to see what type of error it was.
-         */
-        if (pDesc->Desc.ui32CtrlStatus & DES0_TX_STAT_ERR) {
-            /* An error occurred - now look for errors of interest */
-
-            /*
-             * Ensure TX Checksum Offload is enabled before checking for IP
-             * header error status (this status bit is reserved when TX CS
-             * offload is disabled)
-             */
-            if (((pDesc->Desc.ui32CtrlStatus & DES0_TX_CTRL_IP_HDR_CHKSUM) ||
-                (pDesc->Desc.ui32CtrlStatus & DES0_TX_CTRL_IP_ALL_CKHSUMS)) &&
-                (pDesc->Desc.ui32CtrlStatus & DES0_TX_STAT_IPH_ERR)) {
-                /* Error inserting IP header checksum */
-                xEMAC_prv.ulTxIpHdrChksmErrors++;
-            }
-
-            if (pDesc->Desc.ui32CtrlStatus & DES0_TX_STAT_PAYLOAD_ERR) {
-                /* Error in IP payload checksum (i.e. in UDP, TCP or ICMP) */
-                xEMAC_prv.ulTxPayloadChksmErrors++;
-            }
-        }
-
         /* Does this descriptor have a buffer attached to it? */
         if (pDesc->pxNetworkBuffer) {
+            /*
+            * Check this descriptor for transmit errors
+            */
+            if (pDesc->Desc.ui32CtrlStatus & DES0_TX_STAT_ERR) {
+                /* An error occurred - now look for errors of interest.
+                 * Ensure TX Checksum Offload is enabled
+                 */
+                if (((pDesc->Desc.ui32CtrlStatus & DES0_TX_CTRL_IP_HDR_CHKSUM) ||
+                    (pDesc->Desc.ui32CtrlStatus & DES0_TX_CTRL_IP_ALL_CKHSUMS)) &&
+                    (pDesc->Desc.ui32CtrlStatus & DES0_TX_STAT_IPH_ERR)) {
+                    /* Error inserting IP header checksum */
+                    xEMAC_prv.ulTxIpHdrChksmErrors++;
+                }
+
+                if (pDesc->Desc.ui32CtrlStatus & DES0_TX_STAT_PAYLOAD_ERR) {
+                    /* Error in IP payload checksum (i.e. in UDP, TCP or ICMP) */
+                    xEMAC_prv.ulTxPayloadChksmErrors++;
+                }
+            }
             /* Yes - free it*/
             vNetworkBufferReleaseFromISR(pDesc->pxNetworkBuffer);
             pDesc->pxNetworkBuffer = NULL;
@@ -827,7 +893,7 @@ static void prvProcessTransmitted()
             break;
         }
 
-        /* Move on to the next descriptor. */
+        /* Move on to the next descriptor. Wrap if necessary */
         xEMAC_prv.pxTxDescList->ulRead++;
         if (xEMAC_prv.pxTxDescList->ulRead == NUM_TX_DESCRIPTORS) {
             xEMAC_prv.pxTxDescList->ulRead = 0;
@@ -855,22 +921,8 @@ static void prvProcessPhyInterrupt()
     /* Read the current PHY status. */
     status = EMACPHYRead(EMAC0_BASE, PHY_PHYS_ADDR, EPHY_STS);
 
-    /* Has the link status changed? */
-    if (value & EPHY_MISR1_LINKSTAT) {
-        /* Is link up or down now? */
-        if (status & EPHY_STS_LINK) {
-            xEMAC_prv.linkUp = 1;
-        }
-        else {
-            xEMAC_prv.linkUp = 0;
-            iptraceNETWORK_DOWN()
-        }
-        /* Signal the stack for this link status change (from ISR) */
-        SIGNAL_LINK_CHANGE(xEMAC_prv.linkUp);
-    }
-
     /* Has the speed or duplex status changed? */
-    if (value & (EPHY_MISR1_SPEED | EPHY_MISR1_SPEED | EPHY_MISR1_ANC)) {
+    if (value & (EPHY_MISR1_SPEED | EPHY_MISR1_DUPLEXM | EPHY_MISR1_ANC)) {
         /* Get the current MAC configuration. */
         EMACConfigGet(EMAC0_BASE, (uint32_t *)&config, (uint32_t *)&mode,
                         (uint32_t *)&rxMaxFrameSize);
@@ -898,6 +950,20 @@ static void prvProcessPhyInterrupt()
         /* Reconfigure the MAC */
         EMACConfigSet(EMAC0_BASE, config, mode, rxMaxFrameSize);
     }
+    
+    /* Has the link status changed? */
+    if (value & EPHY_MISR1_LINKSTAT) {
+        /* Is link up or down now? */
+        if (status & EPHY_STS_LINK) {
+            xEMAC_prv.linkUp = 1;
+        }
+        else {
+            xEMAC_prv.linkUp = 0;
+            iptraceNETWORK_DOWN()
+        }
+        /* Signal the stack for this link status change (from ISR) */
+        SIGNAL_LINK_CHANGE(xEMAC_prv.linkUp);
+    }
 }
 /*-------------------------------------------*/
 
@@ -915,17 +981,6 @@ static void prv_xHwiIntFxn(uintptr_t callbacks)
     uint32_t status;
 
     iptraceNETWORK_EVENT_RECEIVED();
-    
-    /* Check link status */
-    status = (EMACPHYRead(EMAC0_BASE, PHY_PHYS_ADDR, EPHY_BMSR) & EPHY_BMSR_LINKSTAT);
-
-    /* Signal the stack if link status changed */
-    if (status != xEMAC_prv.linkUp) {
-        SIGNAL_LINK_CHANGE(xEMAC_prv.linkUp);//xEMAC_prv.hEvent, status, 1);
-    }
-
-    /* Set the link status */
-    xEMAC_prv.linkUp = status;
 
     xEMAC_prv.ulIsrCount++;
 
